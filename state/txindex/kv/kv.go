@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -186,6 +187,38 @@ func (txi *TxIndex) indexEvents(result *abci.TxResult, hash []byte, store dbm.Ba
 	return nil
 }
 
+type hashKey struct {
+	hash   string
+	height int64
+}
+
+type hashKeySorter struct {
+	keys []hashKey
+	by   func(t1, t2 *hashKey) bool
+}
+
+func (t *hashKeySorter) Less(i, j int) bool { return t.by(&t.keys[i], &t.keys[j]) }
+func (t *hashKeySorter) Len() int           { return len(t.keys) }
+func (t *hashKeySorter) Swap(i, j int)      { t.keys[i], t.keys[j] = t.keys[j], t.keys[i] }
+
+func byHeightDesc(i, j *hashKey) bool {
+	hi := i.height
+	hj := j.height
+	if hi == hj {
+		return i.hash > j.hash
+	}
+	return hi > hj
+}
+
+func byHeightAsc(i, j *hashKey) bool {
+	hi := i.height
+	hj := j.height
+	if hi == hj {
+		return i.hash < j.hash
+	}
+	return hi < hj
+}
+
 // Search performs a search using the given query.
 //
 // It breaks the query into conditions (like "tx.height > 5"). For each
@@ -197,36 +230,36 @@ func (txi *TxIndex) indexEvents(result *abci.TxResult, hash []byte, store dbm.Ba
 //
 // Search will exit early and return any result fetched so far,
 // when a message is received on the context chan.
-func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error) {
+func (txi *TxIndex) Search(ctx context.Context, q *query.Query, pagSettings txindex.Pagination) ([]*abci.TxResult, int, error) {
 	select {
 	case <-ctx.Done():
-		return make([]*abci.TxResult, 0), nil
+		return make([]*abci.TxResult, 0), 0, nil
 
 	default:
 	}
 
 	var hashesInitialized bool
-	filteredHashes := make(map[string][]byte)
+	filteredHashes := make(map[string]TxInfo)
 
 	// get a list of conditions (like "tx.height > 5")
 	conditions, err := q.Conditions()
 	if err != nil {
-		return nil, fmt.Errorf("error during parsing conditions from query: %w", err)
+		return nil, 0, fmt.Errorf("error during parsing conditions from query: %w", err)
 	}
 
 	// if there is a hash condition, return the result immediately
 	hash, ok, err := lookForHash(conditions)
 	if err != nil {
-		return nil, fmt.Errorf("error during searching for a hash in the query: %w", err)
+		return nil, 0, fmt.Errorf("error during searching for a hash in the query: %w", err)
 	} else if ok {
 		res, err := txi.Get(hash)
 		switch {
 		case err != nil:
-			return []*abci.TxResult{}, fmt.Errorf("error while retrieving the result: %w", err)
+			return []*abci.TxResult{}, 0, fmt.Errorf("error while retrieving the result: %w", err)
 		case res == nil:
-			return []*abci.TxResult{}, nil
+			return []*abci.TxResult{}, 0, nil
 		default:
-			return []*abci.TxResult{res}, nil
+			return []*abci.TxResult{res}, 0, nil
 		}
 	}
 
@@ -282,6 +315,11 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 			continue
 		}
 
+		// skip if the operand is empty (e.g. message.action='')
+		if len(fmt.Sprintf("%v", c.Operand)) == 0 {
+			continue
+		}
+
 		if !hashesInitialized {
 			filteredHashes = txi.match(ctx, c, startKeyForCondition(c, heightInfo.height), filteredHashes, true, heightInfo)
 			hashesInitialized = true
@@ -296,14 +334,60 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 		}
 	}
 
-	results := make([]*abci.TxResult, 0, len(filteredHashes))
+	numResults := len(filteredHashes)
+
+	// Convert map keys to slice for deterministic ordering
+	hashKeys := make([]hashKey, 0, numResults)
+	for k, v := range filteredHashes {
+		hashKeys = append(hashKeys, hashKey{hash: k, height: v.Height})
+	}
+
+	var by func(i, j *hashKey) bool
+
+	if pagSettings.OrderDesc {
+		by = byHeightDesc
+	} else {
+		by = byHeightAsc
+	}
+
+	// Sort by height
+	sort.Sort(&hashKeySorter{
+		keys: hashKeys,
+		by:   by,
+	})
+
+	// If paginated, determine which hash keys to return
+	if pagSettings.IsPaginated {
+		// Now that we know the total number of results, validate that the page
+		// requested is within bounds
+		pagSettings.Page, err = validatePage(&pagSettings.Page, pagSettings.PerPage, numResults)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// Calculate pagination start and end indices
+		startIndex := (pagSettings.Page - 1) * pagSettings.PerPage
+		endIndex := startIndex + pagSettings.PerPage
+
+		// Apply pagination limits
+		if endIndex > len(hashKeys) {
+			endIndex = len(hashKeys)
+		}
+		if startIndex >= len(hashKeys) {
+			return []*abci.TxResult{}, 0, nil
+		}
+
+		hashKeys = hashKeys[startIndex:endIndex]
+	}
+
+	results := make([]*abci.TxResult, 0, len(hashKeys))
 	resultMap := make(map[string]struct{})
 RESULTS_LOOP:
-	for _, h := range filteredHashes {
-
+	for _, hKey := range hashKeys {
+		h := filteredHashes[hKey.hash].TxBytes
 		res, err := txi.Get(h)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get Tx{%X}: %w", h, err)
+			return nil, 0, fmt.Errorf("failed to get Tx{%X}: %w", h, err)
 		}
 		hashString := string(h)
 		if _, ok := resultMap[hashString]; !ok {
@@ -318,7 +402,7 @@ RESULTS_LOOP:
 		}
 	}
 
-	return results, nil
+	return results, numResults, nil
 }
 
 func lookForHash(conditions []query.Condition) (hash []byte, ok bool, err error) {
@@ -331,9 +415,34 @@ func lookForHash(conditions []query.Condition) (hash []byte, ok bool, err error)
 	return
 }
 
-func (txi *TxIndex) setTmpHashes(tmpHeights map[string][]byte, it dbm.Iterator) {
-	eventSeq := extractEventSeqFromKey(it.Key())
-	tmpHeights[string(it.Value())+eventSeq] = it.Value()
+type TxInfo struct {
+	TxBytes []byte
+	Height  int64
+}
+
+func (*TxIndex) setTmpHashes(tmpHeights map[string]TxInfo, key, value []byte, height int64) {
+	eventSeq := extractEventSeqFromKey(key)
+	txInfo := TxInfo{
+		TxBytes: value,
+		Height:  height,
+	}
+	tmpHeights[string(value)+eventSeq] = txInfo
+}
+
+func checkBounds(ranges indexer.QueryRange, v *big.Int) bool {
+	include := true
+	lowerBound := ranges.LowerBoundValue()
+	upperBound := ranges.UpperBoundValue()
+
+	if lowerBound != nil && v.Cmp(lowerBound.(*big.Int)) == -1 {
+		include = false
+	}
+
+	if upperBound != nil && v.Cmp(upperBound.(*big.Int)) == 1 {
+		include = false
+	}
+
+	return include
 }
 
 // match returns all matching txs by hash that meet a given condition and start
@@ -341,21 +450,26 @@ func (txi *TxIndex) setTmpHashes(tmpHeights map[string][]byte, it dbm.Iterator) 
 // non-intersecting matches are removed.
 //
 // NOTE: filteredHashes may be empty if no previous condition has matched.
+//
+// Additionally, this method retrieves the height of the hash via the key,
+// and adds it to the TxInfo struct, which is then added to the filteredHashes.
+// This is done to paginate the results prior to retrieving all the TxResults,
+// which is needed for performance reasons.
 func (txi *TxIndex) match(
 	ctx context.Context,
 	c query.Condition,
 	startKeyBz []byte,
-	filteredHashes map[string][]byte,
+	filteredHashes map[string]TxInfo,
 	firstRun bool,
 	heightInfo HeightInfo,
-) map[string][]byte {
+) map[string]TxInfo {
 	// A previous match was attempted but resulted in no matches, so we return
 	// no matches (assuming AND operand).
 	if !firstRun && len(filteredHashes) == 0 {
 		return filteredHashes
 	}
 
-	tmpHashes := make(map[string][]byte)
+	tmpHashes := make(map[string]TxInfo)
 
 	switch c.Op {
 	case query.OpEqual:
@@ -370,12 +484,21 @@ func (txi *TxIndex) match(
 
 			// If we have a height range in a query, we need only transactions
 			// for this height
-			keyHeight, err := extractHeightFromKey(it.Key())
-			if err != nil || !checkHeightConditions(heightInfo, keyHeight) {
+			key := it.Key()
+			keyHeight, err := extractHeightFromKey(key)
+			if err != nil {
+				// txi.log.Error("failure to parse height from key:", err)
 				continue
 			}
-
-			txi.setTmpHashes(tmpHashes, it)
+			withinBounds := checkHeightConditions(heightInfo, keyHeight)
+			// if err != nil {
+			// 	txi.log.Error("failure checking for height bounds:", err)
+			// 	continue
+			// }
+			if !withinBounds {
+				continue
+			}
+			txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 			// Potentially exit early.
 			select {
 			case <-ctx.Done():
@@ -398,11 +521,20 @@ func (txi *TxIndex) match(
 
 	EXISTS_LOOP:
 		for ; it.Valid(); it.Next() {
-			keyHeight, err := extractHeightFromKey(it.Key())
+			key := it.Key()
+			keyHeight, err := extractHeightFromKey(key)
 			if err != nil || !checkHeightConditions(heightInfo, keyHeight) {
 				continue
 			}
-			txi.setTmpHashes(tmpHashes, it)
+			// withinBounds, err := checkHeightConditions(heightInfo, keyHeight)
+			// if err != nil {
+			// 	txi.log.Error("failure checking for height bounds:", err)
+			// 	continue
+			// }
+			// if !withinBounds {
+			// 	continue
+			// }
+			txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 
 			// Potentially exit early.
 			select {
@@ -427,16 +559,25 @@ func (txi *TxIndex) match(
 
 	CONTAINS_LOOP:
 		for ; it.Valid(); it.Next() {
-			if !isTagKey(it.Key()) {
+			key := it.Key()
+			if !isTagKey(key) {
 				continue
 			}
 
-			if strings.Contains(extractValueFromKey(it.Key()), c.Operand.(string)) {
-				keyHeight, err := extractHeightFromKey(it.Key())
+			if strings.Contains(extractValueFromKey(key), c.Operand.(string)) {
+				keyHeight, err := extractHeightFromKey(key)
 				if err != nil || !checkHeightConditions(heightInfo, keyHeight) {
 					continue
 				}
-				txi.setTmpHashes(tmpHashes, it)
+				// withinBounds, err := checkHeightConditions(heightInfo, keyHeight)
+				// if err != nil {
+				// 	txi.log.Error("failure checking for height bounds:", err)
+				// 	continue
+				// }
+				// if !withinBounds {
+				// 	continue
+				// }
+				txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 			}
 
 			// Potentially exit early.
@@ -469,15 +610,18 @@ func (txi *TxIndex) match(
 REMOVE_LOOP:
 	for k, v := range filteredHashes {
 		tmpHash := tmpHashes[k]
-		if tmpHash == nil || !bytes.Equal(tmpHash, v) {
+		if tmpHash.TxBytes == nil || !bytes.Equal(tmpHash.TxBytes, v.TxBytes) {
 			delete(filteredHashes, k)
-
-			// Potentially exit early.
-			select {
-			case <-ctx.Done():
-				break REMOVE_LOOP
-			default:
-			}
+		} else {
+			// If there is a match, update the height in filteredHashes
+			v.Height = tmpHash.Height
+			filteredHashes[k] = v
+		}
+		// Potentially exit early.
+		select {
+		case <-ctx.Done():
+			break REMOVE_LOOP
+		default:
 		}
 	}
 
@@ -489,21 +633,26 @@ REMOVE_LOOP:
 // any non-intersecting matches are removed.
 //
 // NOTE: filteredHashes may be empty if no previous condition has matched.
+//
+// Additionally, this method retrieves the height of the hash via the key,
+// and adds it to the TxInfo struct, which is then added to the filteredHashes.
+// This is done to paginate the results prior to retrieving all the TxResults,
+// which is needed for performance reasons.
 func (txi *TxIndex) matchRange(
 	ctx context.Context,
 	qr indexer.QueryRange,
 	startKey []byte,
-	filteredHashes map[string][]byte,
+	filteredHashes map[string]TxInfo,
 	firstRun bool,
 	heightInfo HeightInfo,
-) map[string][]byte {
+) map[string]TxInfo {
 	// A previous match was attempted but resulted in no matches, so we return
 	// no matches (assuming AND operand).
 	if !firstRun && len(filteredHashes) == 0 {
 		return filteredHashes
 	}
 
-	tmpHashes := make(map[string][]byte)
+	tmpHashes := make(map[string]TxInfo)
 
 	it, err := dbm.IteratePrefix(txi.store, startKey)
 	if err != nil {
@@ -513,26 +662,37 @@ func (txi *TxIndex) matchRange(
 
 LOOP:
 	for ; it.Valid(); it.Next() {
-		if !isTagKey(it.Key()) {
+		key := it.Key()
+		if !isTagKey(key) {
 			continue
 		}
 
 		if _, ok := qr.AnyBound().(*big.Int); ok {
 			v := new(big.Int)
-			eventValue := extractValueFromKey(it.Key())
+			eventValue := extractValueFromKey(key)
 			v, ok := v.SetString(eventValue, 10)
 			if !ok {
 				continue LOOP
 			}
-			if qr.Key != types.TxHeightKey {
-				keyHeight, err := extractHeightFromKey(it.Key())
-				if err != nil || !checkHeightConditions(heightInfo, keyHeight) {
-					continue LOOP
-				}
-
+			// Regardless of the query condition, we retrieve the height in order to sort later
+			keyHeight, err := extractHeightFromKey(key)
+			if err != nil {
+				// txi.log.Error("failure to parse height from key:", err)
+				continue
 			}
-			if checkBounds(qr, v) {
-				txi.setTmpHashes(tmpHashes, it)
+			if qr.Key != types.TxHeightKey {
+				withinBounds := checkHeightConditions(heightInfo, keyHeight)
+				// if err != nil {
+				// 	txi.log.Error("failure checking for height bounds:", err)
+				// 	continue
+				// }
+				if !withinBounds {
+					continue
+				}
+			}
+			withinBounds := checkBounds(qr, v)
+			if withinBounds {
+				txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 			}
 
 			// XXX: passing time in a ABCI Events is not yet implemented
@@ -570,15 +730,19 @@ LOOP:
 REMOVE_LOOP:
 	for k, v := range filteredHashes {
 		tmpHash := tmpHashes[k]
-		if tmpHash == nil || !bytes.Equal(tmpHashes[k], v) {
+		if tmpHash.TxBytes == nil || !bytes.Equal(tmpHash.TxBytes, v.TxBytes) {
 			delete(filteredHashes, k)
+		} else {
+			// If there is a match, update the height in filteredHashes
+			v.Height = tmpHash.Height
+			filteredHashes[k] = v
+		}
 
-			// Potentially exit early.
-			select {
-			case <-ctx.Done():
-				break REMOVE_LOOP
-			default:
-			}
+		// Potentially exit early.
+		select {
+		case <-ctx.Done():
+			break REMOVE_LOOP
+		default:
 		}
 	}
 
@@ -664,27 +828,23 @@ func startKey(fields ...interface{}) []byte {
 	return b.Bytes()
 }
 
-func checkBounds(ranges indexer.QueryRange, v *big.Int) bool {
-	include := true
-	lowerBound := ranges.LowerBoundValue()
-	upperBound := ranges.UpperBoundValue()
-	if lowerBound != nil && v.Cmp(lowerBound.(*big.Int)) == -1 {
-		include = false
+func validatePage(pagePtr *int, perPage, totalCount int) (int, error) {
+	if perPage < 1 {
+		return 1, fmt.Errorf("zero or negative perPage: %d", perPage)
 	}
 
-	if upperBound != nil && v.Cmp(upperBound.(*big.Int)) == 1 {
-		include = false
+	if pagePtr == nil { // no page parameter
+		return 1, nil
 	}
 
-	return include
-}
-
-//nolint:unused,deadcode
-func lookForHeight(conditions []query.Condition) (height int64) {
-	for _, c := range conditions {
-		if c.CompositeKey == types.TxHeightKey && c.Op == query.OpEqual {
-			return c.Operand.(int64)
-		}
+	pages := ((totalCount - 1) / perPage) + 1
+	if pages == 0 {
+		pages = 1 // one page (even if it's empty)
 	}
-	return 0
+	page := *pagePtr
+	if page <= 0 || page > pages {
+		return 1, fmt.Errorf("page should be within [1, %d] range, given %d", pages, page)
+	}
+
+	return page, nil
 }

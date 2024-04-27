@@ -29,6 +29,6 @@ func (txi *TxIndex) Index(result *abci.TxResult) error {
 	return nil
 }
 
-func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error) {
-	return []*abci.TxResult{}, nil
+func (*TxIndex) Search(_ context.Context, _ *query.Query, _ txindex.Pagination) ([]*abci.TxResult, int, error) {
+	return []*abci.TxResult{}, 0, nil
 }

@@ -25,13 +25,23 @@ type TxIndexer interface {
 	Get(hash []byte) (*abci.TxResult, error)
 
 	// Search allows you to query for transactions.
-	Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error)
+	Search(ctx context.Context, q *query.Query, pagSettings Pagination) ([]*abci.TxResult, int, error)
 }
 
 // Batch groups together multiple Index operations to be performed at the same time.
 // NOTE: Batch is NOT thread-safe and must not be modified after starting its execution.
 type Batch struct {
 	Ops []*abci.TxResult
+}
+
+// Pagination provides pagination information for queries.
+// This allows us to use the same TxSearch API for pruning to return all relevant data,
+// while still limiting public queries to pagination.
+type Pagination struct {
+	OrderDesc   bool
+	IsPaginated bool
+	Page        int
+	PerPage     int
 }
 
 // NewBatch creates a new Batch.
