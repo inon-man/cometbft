@@ -39,7 +39,9 @@ func Tx(ctx *rpctypes.Context, hash []byte, prove bool) (*ctypes.ResultTx, error
 	var proof types.TxProof
 	if prove {
 		block := env.BlockStore.LoadBlock(r.Height)
-		proof = block.Data.Txs.Proof(int(r.Index))
+		if block != nil {
+			proof = block.Data.Txs.Proof(int(r.Index))
+		}
 	}
 
 	return &ctypes.ResultTx{
@@ -104,7 +106,9 @@ func TxSearch(
 		var proof types.TxProof
 		if prove {
 			block := env.BlockStore.LoadBlock(r.Height)
-			proof = block.Data.Txs.Proof(int(r.Index))
+			if block != nil {
+				proof = block.Data.Txs.Proof(int(r.Index))
+			}
 		}
 
 		apiResults = append(apiResults, &ctypes.ResultTx{

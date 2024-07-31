@@ -36,6 +36,7 @@ var (
 	ErrInvalidProposalPOLRound    = errors.New("error invalid proposal POL round")
 	ErrAddingVote                 = errors.New("error adding vote")
 	ErrSignatureFoundInPastBlocks = errors.New("found signature from the same key")
+	ErrProposalTooManyParts       = errors.New("proposal block has too many parts")
 
 	errPubKeyIsNotSet = errors.New("pubkey is not set. Look for \"Can't get private validator pubkey\" errors")
 )
@@ -1701,13 +1702,13 @@ func (cs *State) finalizeCommit(height int64) {
 	stateCopy := cs.state.Copy()
 
 	// Execute and commit the block, update and save the state, and update the mempool.
+	// We use apply verified block here because we have verified the block in this function already.
 	// NOTE The block.AppHash wont reflect these txs until the next block.
 	var (
 		err          error
 		retainHeight int64
 	)
-
-	stateCopy, retainHeight, err = cs.blockExec.ApplyBlock(
+	stateCopy, retainHeight, err = cs.blockExec.ApplyVerifiedBlock(
 		stateCopy,
 		types.BlockID{
 			Hash:          block.Hash(),
@@ -1885,6 +1886,15 @@ func (cs *State) defaultSetProposal(proposal *types.Proposal) error {
 		types.ProposalSignBytes(cs.state.ChainID, p), proposal.Signature,
 	) {
 		return ErrInvalidProposalSignature
+	}
+
+	// Validate the proposed block size, derived from its PartSetHeader
+	maxBytes := cs.state.ConsensusParams.Block.MaxBytes
+	if maxBytes == -1 {
+		maxBytes = int64(types.MaxBlockSizeBytes)
+	}
+	if int64(proposal.BlockID.PartSetHeader.Total) > (maxBytes-1)/int64(types.BlockPartSizeBytes)+1 {
+		return ErrProposalTooManyParts
 	}
 
 	proposal.Signature = p.Signature

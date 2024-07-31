@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
@@ -22,8 +23,9 @@ import (
 )
 
 const (
-	tagKeySeparator   = "/"
-	eventSeqSeparator = "$es$"
+	tagKeySeparator     = "/"
+	tagKeySeparatorRune = '/'
+	eventSeqSeparator   = "$es$"
 )
 
 var _ txindex.TxIndexer = (*TxIndex)(nil)
@@ -662,6 +664,9 @@ func (txi *TxIndex) matchRange(
 
 LOOP:
 	for ; it.Valid(); it.Next() {
+		// TODO: We need to make a function for getting it.Key() as a byte slice with no copies.
+		// It currently copies the source data (which can change on a subsequent .Next() call) but that
+		// is not an issue for us.
 		key := it.Key()
 		if !isTagKey(key) {
 			continue
@@ -756,29 +761,62 @@ func isTagKey(key []byte) bool {
 	// tags should 4. Alternatively it should be 3 if the event was not indexed
 	// with the corresponding event sequence. However, some attribute values in
 	// production can contain the tag separator. Therefore, the condition is >= 3.
-	numTags := strings.Count(string(key), tagKeySeparator)
-	return numTags >= 3
+	numTags := 0
+	for i := 0; i < len(key); i++ {
+		if key[i] == tagKeySeparatorRune {
+			numTags++
+			if numTags >= 3 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractHeightFromKey(key []byte) (int64, error) {
-	parts := strings.SplitN(string(key), tagKeySeparator, -1)
-
-	return strconv.ParseInt(parts[len(parts)-2], 10, 64)
-}
-func extractValueFromKey(key []byte) string {
-	keyString := string(key)
-	parts := strings.SplitN(keyString, tagKeySeparator, -1)
-	partsLen := len(parts)
-	value := strings.TrimPrefix(keyString, parts[0]+tagKeySeparator)
-
-	suffix := ""
-	suffixLen := 2
-
-	for i := 1; i <= suffixLen; i++ {
-		suffix = tagKeySeparator + parts[partsLen-i] + suffix
+	// the height is the second last element in the key.
+	// Find the position of the last occurrence of tagKeySeparator
+	endPos := bytes.LastIndexByte(key, tagKeySeparatorRune)
+	if endPos == -1 {
+		return 0, errors.New("separator not found")
 	}
-	return strings.TrimSuffix(value, suffix)
 
+	// Find the position of the second last occurrence of tagKeySeparator
+	startPos := bytes.LastIndexByte(key[:endPos-1], tagKeySeparatorRune)
+	if startPos == -1 {
+		return 0, errors.New("second last separator not found")
+	}
+
+	// Extract the height part of the key
+	height, err := strconv.ParseInt(string(key[startPos+1:endPos]), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return height, nil
+}
+
+func extractValueFromKey(key []byte) string {
+	// Find the positions of tagKeySeparator in the byte slice
+	var indices []int
+	for i, b := range key {
+		if b == tagKeySeparatorRune {
+			indices = append(indices, i)
+		}
+	}
+
+	// If there are less than 2 occurrences of tagKeySeparator, return an empty string
+	if len(indices) < 2 {
+		return ""
+	}
+
+	// Extract the value between the first and second last occurrence of tagKeySeparator
+	value := key[indices[0]+1 : indices[len(indices)-2]]
+
+	// Trim any leading or trailing whitespace
+	value = bytes.TrimSpace(value)
+
+	// TODO: Do an unsafe cast to avoid an extra allocation here
+	return string(value)
 }
 
 func extractEventSeqFromKey(key []byte) string {
@@ -791,6 +829,7 @@ func extractEventSeqFromKey(key []byte) string {
 	}
 	return "0"
 }
+
 func keyForEvent(key string, value string, result *abci.TxResult, eventSeq int64) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%d/%d%s",
 		key,

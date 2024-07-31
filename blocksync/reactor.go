@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	bcproto "github.com/cometbft/cometbft/proto/tendermint/blocksync"
@@ -55,13 +56,14 @@ type Reactor struct {
 	store     *store.BlockStore
 	pool      *BlockPool
 	blockSync bool
+	localAddr crypto.Address
 
 	requestsCh <-chan BlockRequest
 	errorsCh   <-chan peerError
 }
 
-func NewReactorWithOfflineStateSync(state sm.State, blockExec *sm.BlockExecutor, store *store.BlockStore,
-	blockSync bool, offlineStateSyncHeight int64) *Reactor {
+func NewReactorWithOfflineStateSyncAndAddr(state sm.State, blockExec *sm.BlockExecutor, store *store.BlockStore,
+	blockSync bool, localAddr crypto.Address, offlineStateSyncHeight int64) *Reactor {
 
 	storeHeight := store.Height()
 	if storeHeight == 0 {
@@ -77,7 +79,10 @@ func NewReactorWithOfflineStateSync(state sm.State, blockExec *sm.BlockExecutor,
 		panic(fmt.Sprintf("state (%v) and store (%v) height mismatch, stores were left in an inconsistent state", state.LastBlockHeight,
 			storeHeight))
 	}
-	requestsCh := make(chan BlockRequest, maxTotalRequesters)
+
+	// It's okay to block since sendRequest is called from a separate goroutine
+	// (bpRequester#requestRoutine; 1 per each peer).
+	requestsCh := make(chan BlockRequest)
 
 	const capacity = 1000                      // must be bigger than peers count
 	errorsCh := make(chan peerError, capacity) // so we don't block in #Receive#pool.AddBlock
@@ -94,11 +99,17 @@ func NewReactorWithOfflineStateSync(state sm.State, blockExec *sm.BlockExecutor,
 		store:        store,
 		pool:         pool,
 		blockSync:    blockSync,
+		localAddr:    localAddr,
 		requestsCh:   requestsCh,
 		errorsCh:     errorsCh,
 	}
 	bcR.BaseReactor = *p2p.NewBaseReactor("Reactor", bcR)
 	return bcR
+}
+
+func NewReactorWithOfflineStateSync(state sm.State, blockExec *sm.BlockExecutor, store *store.BlockStore,
+	blockSync bool, offlineStateSyncHeight int64) *Reactor {
+	return NewReactorWithOfflineStateSyncAndAddr(state, blockExec, store, blockSync, nil, offlineStateSyncHeight)
 }
 
 // NewReactor returns new reactor instance.
@@ -244,9 +255,19 @@ func (bcR *Reactor) ReceiveEnvelope(e p2p.Envelope) {
 		bcR.pool.SetPeerRange(e.Src.ID(), msg.Base, msg.Height)
 	case *bcproto.NoBlockResponse:
 		bcR.Logger.Debug("Peer does not have requested block", "peer", e.Src, "height", msg.Height)
+		bcR.pool.RedoRequestFrom(msg.Height, e.Src.ID())
 	default:
 		bcR.Logger.Error(fmt.Sprintf("Unknown message type %v", reflect.TypeOf(msg)))
 	}
+}
+
+func (bcR *Reactor) localNodeBlocksTheChain(state sm.State) bool {
+	_, val := state.Validators.GetByAddress(bcR.localAddr)
+	if val == nil {
+		return false
+	}
+	total := state.Validators.TotalVotingPower()
+	return val.VotingPower >= total/3
 }
 
 // Handle messages from the poolReactor telling the reactor what to do.
@@ -313,7 +334,7 @@ FOR_LOOP:
 			outbound, inbound, _ := bcR.Switch.NumPeers()
 			bcR.Logger.Debug("Consensus ticker", "numPending", numPending, "total", lenRequesters,
 				"outbound", outbound, "inbound", inbound)
-			if bcR.pool.IsCaughtUp() {
+			if bcR.pool.IsCaughtUp() || bcR.localNodeBlocksTheChain(state) {
 				bcR.Logger.Info("Time to switch to consensus reactor!", "height", height)
 				if err := bcR.pool.Stop(); err != nil {
 					bcR.Logger.Error("Error stopping pool", "err", err)
@@ -378,14 +399,14 @@ FOR_LOOP:
 
 			if err != nil {
 				bcR.Logger.Error("Error in validation", "err", err)
-				peerID := bcR.pool.RedoRequest(first.Height)
+				peerID := bcR.pool.RemovePeerAndRedoAllPeerRequests(first.Height)
 				peer := bcR.Switch.Peers().Get(peerID)
 				if peer != nil {
 					// NOTE: we've already removed the peer's request, but we
 					// still need to clean up the rest.
 					bcR.Switch.StopPeerForError(peer, fmt.Errorf("Reactor validation error: %v", err))
 				}
-				peerID2 := bcR.pool.RedoRequest(second.Height)
+				peerID2 := bcR.pool.RemovePeerAndRedoAllPeerRequests(second.Height)
 				peer2 := bcR.Switch.Peers().Get(peerID2)
 				if peer2 != nil && peer2 != peer {
 					// NOTE: we've already removed the peer's request, but we
@@ -402,7 +423,7 @@ FOR_LOOP:
 
 			// TODO: same thing for app - but we would need a way to
 			// get the hash without persisting the state
-			state, _, err = bcR.blockExec.ApplyBlock(state, firstID, first)
+			state, _, err = bcR.blockExec.ApplyVerifiedBlock(state, firstID, first)
 			if err != nil {
 				// TODO This is bad, are we zombie?
 				panic(fmt.Sprintf("Failed to process committed block (%d:%X): %v", first.Height, first.Hash(), err))

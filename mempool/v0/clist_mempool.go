@@ -49,6 +49,8 @@ type CListMempool struct {
 	// serial (ie. by abci responses which are called in serial).
 	recheckCursor *clist.CElement // next expected response
 	recheckEnd    *clist.CElement // re-checking stops here
+	isRechecking  atomic.Bool     // true iff the rechecking process has begun and is not yet finished
+	recheckFull   atomic.Bool     // whether rechecking TXs cannot be completed before a new block is decided
 
 	// Map for quick access to txs to record sender in CheckTx.
 	// txsMap: txKey -> CElement
@@ -135,6 +137,13 @@ func WithMetrics(metrics *mempool.Metrics) CListMempoolOption {
 
 // Safe for concurrent use by multiple goroutines.
 func (mem *CListMempool) Lock() {
+	// Prepare for Update by setting recheckFull
+	rechecking := mem.isRechecking.Load()
+	recheckFull := mem.recheckFull.Swap(rechecking)
+	if rechecking != recheckFull {
+		mem.logger.Debug("the state of recheckFull has flipped")
+	}
+
 	mem.updateMtx.Lock()
 }
 
@@ -380,12 +389,11 @@ func (mem *CListMempool) RemoveTxByKey(txKey types.TxKey) error {
 }
 
 func (mem *CListMempool) isFull(txSize int) error {
-	var (
-		memSize  = mem.Size()
-		txsBytes = mem.SizeBytes()
-	)
+	memSize := mem.Size()
+	txsBytes := mem.SizeBytes()
+	recheckFull := mem.recheckFull.Load()
 
-	if memSize >= mem.config.Size || int64(txSize)+txsBytes > mem.config.MaxTxsBytes {
+	if memSize >= mem.config.Size || int64(txSize)+txsBytes > mem.config.MaxTxsBytes || recheckFull {
 		return mempool.ErrMempoolIsFull{
 			NumTxs:      memSize,
 			MaxTxs:      mem.config.Size,
@@ -505,6 +513,8 @@ func (mem *CListMempool) resCbRecheck(req *abci.Request, res *abci.Response) {
 				// matching the one we received from the ABCI application.
 				// Return without processing any tx.
 				mem.recheckCursor = nil
+				mem.isRechecking.Store(false)
+				mem.recheckFull.Store(false)
 				return
 			}
 
@@ -527,6 +537,8 @@ func (mem *CListMempool) resCbRecheck(req *abci.Request, res *abci.Response) {
 		}
 		if mem.recheckCursor == mem.recheckEnd {
 			mem.recheckCursor = nil
+			mem.isRechecking.Store(false)
+			mem.recheckFull.Store(false)
 		} else {
 			mem.recheckCursor = mem.recheckCursor.Next()
 		}
@@ -714,6 +726,7 @@ func (mem *CListMempool) recheckTxs() {
 
 	mem.recheckCursor = mem.txs.Front()
 	mem.recheckEnd = mem.txs.Back()
+	mem.isRechecking.Store(true)
 
 	// Push txs to proxyAppConn
 	// NOTE: globalCb may be called concurrently.
