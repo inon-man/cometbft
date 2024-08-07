@@ -30,7 +30,7 @@ eg, L = latency = 0.1s
 */
 
 const (
-	requestIntervalMS         = 2
+	maxPendingRequests        = 500
 	maxPendingRequestsPerPeer = 20
 	requestRetrySeconds       = 30
 
@@ -54,7 +54,10 @@ const (
 	minBlocksForSingleRequest = 50
 )
 
-var peerTimeout = 15 * time.Second // not const so we can override with tests
+var (
+	requestInterval = 10 * time.Millisecond // timeout between requests
+	peerTimeout     = 15 * time.Second      // not const so we can override with tests
+)
 
 /*
 	Peers self report their heights when we join the block pool.
@@ -133,23 +136,22 @@ func (pool *BlockPool) makeRequestersRoutine() {
 
 		pool.mtx.Lock()
 		var (
-			maxRequestersCreated = len(pool.requesters) >= len(pool.peers)*maxPendingRequestsPerPeer
-
 			nextHeight           = pool.height + int64(len(pool.requesters))
+			maxRequestersCreated = len(pool.requesters) >= len(pool.peers)*maxPendingRequestsPerPeer || nextHeight-pool.height > maxPendingRequests
 			maxPeerHeightReached = nextHeight > pool.maxPeerHeight
 		)
 		pool.mtx.Unlock()
 
 		switch {
 		case maxRequestersCreated: // If we have enough requesters, wait for them to finish.
-			time.Sleep(requestIntervalMS * time.Millisecond)
+			time.Sleep(requestInterval)
 			pool.removeTimedoutPeers()
 		case maxPeerHeightReached: // If we're caught up, wait for a bit so reactor could finish or a higher height is reported.
-			time.Sleep(requestIntervalMS * time.Millisecond)
+			time.Sleep(requestInterval)
 		default:
 			pool.makeNextRequester(nextHeight)
 			// Sleep for a bit to make the requests more ordered.
-			time.Sleep(requestIntervalMS * time.Millisecond)
+			time.Sleep(requestInterval)
 		}
 	}
 }
@@ -749,7 +751,7 @@ PICK_PEER_LOOP:
 		peer = bpr.pool.pickIncrAvailablePeer(bpr.height, secondPeerID)
 		if peer == nil {
 			bpr.Logger.Debug("No peers currently available; will retry shortly", "height", bpr.height)
-			time.Sleep(requestIntervalMS * time.Millisecond)
+			time.Sleep(requestInterval)
 			continue PICK_PEER_LOOP
 		}
 		break PICK_PEER_LOOP
